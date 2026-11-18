@@ -1,0 +1,68 @@
+# tailcycle-run site configuration.
+# Copy to ~/.config/tailcycle-run/config.toml (or point TAILCYCLE_RUN_CONFIG at
+# it) and replace every <placeholder>. Keep the real file OUT of git: it names
+# hosts, users and paths.
+
+# Animals held out as a sealed test set: submit/batch refuse them unless
+# --allow-sealed is passed.
+sealed_animals = []
+
+[cluster]
+login       = "<user>@<login-host>"          # ssh target for bsub / bjobs / df only
+home        = "<cluster-home-path>"           # your home as compute nodes see it
+smb_mount   = "<local-mount-of-cluster-home>" # ALL bulk data moves over this mount
+df_path     = "<cluster-filesystem-to-check>" # free-space gate (default: home)
+project     = "<lsf-project>"                 # bsub -P
+queue       = "gpu_l4"
+wall        = "8:00"
+slots       = 8
+work_dir    = "~/mouse_cluster"               # staging + predictions, home-relative
+tools_dir   = "~/tailcycle_run_tools"         # content-hashed harness script dirs
+tailcycle_repo = "$HOME/tailcyclenet"         # default tailcyclenet checkout on the cluster
+pixi        = "$HOME/.pixi/bin/pixi"
+
+[models]
+# Checkpoint / run paths on the CLUSTER filesystem. Leave a variant's paths
+# empty if you don't use it.
+default_model     = "<cluster-path>/runs/<johnson24-run>"        # predict_chunk.sh default
+default_detector  = "<cluster-path>/detectors/<detector-run>/<dataset>"
+mega_run          = "<cluster-path>/runs/<mega-mouse-run>"
+univ_pose_run     = "<cluster-path>/runs/<univ-mouse-pose-run>"
+univ_detector_run = "<cluster-path>/detectors/<univ-mouse-detector-run>"
+univ_scorer_run   = "<cluster-path>/scorers/<univ-mouse-scorer-run>"
+univ2_pose        = "<cluster-path>/tailcycle_models/<univ-mouse-v2>/pose.pth"
+univ2_detector    = "<cluster-path>/tailcycle_models/<univ-mouse-v2>/detector.pth"
+univ2_repo        = "<cluster-path>/tailcyclenet_v2"
+
+[local]
+python              = "<python-with-cv2-numpy-pandas>"
+ffprobe             = "ffprobe"
+log_dir             = "/tmp/tailcycle_run"   # per-session logs, queue files, blur cache
+# blur_cache        = "<path>/blur_cache.json"
+opencv_calib_root   = "<path>/calib"         # <date>/calibration/Cam*.yaml (OpenCV)
+jarvis_calib_root   = "<path>/jarvis_calibrations"   # <date>/Cam*.yaml (JARVIS)
+tailcyclenet_repo   = "<path>/tailcyclenet"  # local checkout, for the preflight checks
+default_video_root  = "<video-root>"         # <animal>/<session>/Cam*.mp4
+default_pred_root   = "<pred-root>"          # <animal>/<session>/<out_name>/data3D.csv
+fallback_pred_root  = "<pred-root>"          # where realigned overrides live for other video roots
+align_pred_roots    = ["<pred-root>"]        # roots apply_world_alignment transforms
+yolo_weights        = "<path>/best.pt"       # 2-class (Mouse, SideCyl) YOLO detector
+analyze_mice_trajectory = "<path>/analyzeMiceTrajectory"   # provides filter_jarvis_with_yolo.py
+behavior_log_root   = "<path>/behavior_logs" # <animal>/session_*/robot_manager.log
+
+[trial_windows]
+video_root = "<video-root>"
+pred_root  = "<pred-root>"
+
+[gate]
+# Env for a site spend gate wrapped around bsub (omit what you don't use).
+session   = "tailcycle-run"
+nosandbox = ""                               # reason string, or "" to omit GATE_NOSANDBOX
+extra     = {}
+
+# One table per data source ("tab"), used by `batch --tab`.
+[sources.example]
+video_root = "<video-root>"
+pred_root  = "<pred-root>"
+animals    = ["<animal>"]
+min_cams   = 16

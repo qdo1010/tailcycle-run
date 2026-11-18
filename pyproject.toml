@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tailcycle-run"
+version = "0.1.0"
+description = "Stage, submit, collect and post-process tailcyclenet 3D mouse pose predictions on an LSF cluster"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy", "pandas", "opencv-python", "pyyaml", "tomli; python_version<'3.11'"]
+
+[project.optional-dependencies]
+yolo = ["ultralytics"]
+test = ["pytest"]
+
+[project.scripts]
+tailcycle-run = "tailcycle_run.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["tailcycle_run*"]
+
+[tool.setuptools.package-data]
+"tailcycle_run.cluster" = ["*.sh"]

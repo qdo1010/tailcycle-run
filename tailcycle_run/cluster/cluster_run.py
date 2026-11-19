@@ -423,6 +423,9 @@ def _remux_staged(vid_sid: str, staged: Path, n_ts: int) -> None:
     (staged / "REMUX_OK").unlink(missing_ok=True)
     rd = f"{CF_REMOTE}/tailcycle_videos/{vid_sid}"
     log_rel = _remote_rel(CLUSTER_LOG_DIR)            # home-relative
+    if log_rel.startswith("/"):
+        raise SystemExit(f"[tailcycle-cluster] cluster.log_dir {CLUSTER_LOG_DIR!r} must be "
+                         f"home-relative (~/...): the rewrap log is read over the mount")
     (LOCAL_CIFS / log_rel).mkdir(parents=True, exist_ok=True)   # LSF won't create it
     name = f"remux_{vid_sid}"
     out = _ssh(f"cd ~ && {_gate_env(f'rewrap {n_ts} staged MPEG-TS cams of {vid_sid} to MP4 (stream copy), CPU only')}"

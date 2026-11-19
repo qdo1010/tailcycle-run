@@ -165,3 +165,40 @@ def test_run_stage_skips_and_stops_at_cap(tmp_path):
                         "--total-cap", "10"], capture_output=True, text=True, timeout=60,
                        env=env, cwd=ROOT)
     assert r.returncode != 0 and "not in the config" in r.stderr
+
+
+def test_remux_staged_submit_and_wait(tmp_path, monkeypatch):
+    """_remux_staged with the mount and ssh faked: the bsub carries the config
+    CPU queue, project and log dir; success = REMUX_OK; a failed log raises."""
+    cr = _load("tailcycle_run/cluster/cluster_run.py")
+    monkeypatch.setattr(cr, "LOCAL_CIFS", tmp_path)
+    monkeypatch.setattr(cr, "_rsync_up", lambda *a, **k: None)
+    monkeypatch.setattr(cr, "CPU_QUEUE", "cpuq")
+    monkeypatch.setattr(cr, "DEFAULT_PROJECT", "projx")
+    monkeypatch.setattr(cr, "CLUSTER_LOG_DIR", "~/joblogs")
+    monkeypatch.setattr(cr.time, "sleep", lambda s: None)
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    sent = []
+
+    def fake_ssh(cmd, timeout=60.0, check=True):
+        sent.append(cmd)
+        (staged / "REMUX_OK").touch()
+        return "Job <42> is submitted to queue <cpuq>."
+    monkeypatch.setattr(cr, "_ssh", fake_ssh)
+    cr._remux_staged("a__s", staged, n_ts=3)
+    cmd = sent[0]
+    assert "-q cpuq " in cmd and "-P projx " in cmd
+    assert "-o ~/joblogs/remux_a__s_%J.out" in cmd
+    assert f"{cr.CF_REMOTE}/remux_ts.sh {cr.CF_REMOTE}/tailcycle_videos/a__s 4" in cmd
+    assert (tmp_path / "joblogs").is_dir()
+
+    def fake_ssh_fail(cmd, timeout=60.0, check=True):
+        (tmp_path / "joblogs" / "remux_a__s_43.out").write_text("x: MISMATCH\nREMUX_HAD_FAILURES\n")
+        return "Job <43> is submitted to queue <cpuq>."
+    monkeypatch.setattr(cr, "_ssh", fake_ssh_fail)
+    with pytest.raises(SystemExit, match="rewrap job 43 failed"):
+        cr._remux_staged("a__s", staged, n_ts=3)
+    monkeypatch.setattr(cr, "CLUSTER_LOG_DIR", "/abs/logs")
+    with pytest.raises(SystemExit, match="home-relative"):
+        cr._remux_staged("a__s", staged, n_ts=3)

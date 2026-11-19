@@ -4,7 +4,8 @@
     python -m tailcycle_run plan   --frames N --windows K
     python -m tailcycle_run submit <cluster_run.py args>        # one session
     python -m tailcycle_run batch  <run_sequential.py args>     # sessions one at a time
-    python -m tailcycle_run post   yolo-clean|body-span|presence|trials|align <args>
+    python -m tailcycle_run run    --plan P.tsv --total-cap GPU_H # univ2_47 plan: submit+guard+post
+    python -m tailcycle_run post   yolo-clean|body-span|presence|trials|hurdle-windows|align <args>
     python -m tailcycle_run guard  --array ID [--merge ID] --cap GPU_H
 """
 from __future__ import annotations
@@ -18,12 +19,15 @@ SCRIPTS = {
     "submit": HERE / "cluster" / "cluster_run.py",
     "batch": HERE / "cluster" / "run_sequential.py",
     "guard": HERE / "cluster" / "burn_guard.py",
+    "run": HERE / "cluster" / "batch_plan.py",
+    "batch-plan": HERE / "cluster" / "batch_plan.py",
 }
 POST = {
     "yolo-clean": HERE / "post" / "yolo_clean.py",
     "body-span": HERE / "post" / "body_span.py",
     "presence": HERE / "post" / "yolo_presence.py",
     "trials": HERE / "post" / "trial_windows.py",
+    "hurdle-windows": HERE / "post" / "hurdle_windows.py",
     "align": HERE / "post" / "apply_world_alignment.py",
     "align-fit": HERE / "post" / "align_world_frames.py",
 }

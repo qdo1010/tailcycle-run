@@ -20,6 +20,8 @@ work_dir    = "~/mouse_cluster"               # staging + predictions, home-rela
 tools_dir   = "~/tailcycle_run_tools"         # content-hashed harness script dirs
 tailcycle_repo = "$HOME/tailcyclenet"         # default tailcyclenet checkout on the cluster
 pixi        = "$HOME/.pixi/bin/pixi"
+cpu_queue   = "local"                         # CPU-only jobs (the MPEG-TS -> MP4 rewrap)
+log_dir     = "~/logs"                        # home-relative; CPU job logs, read back over smb_mount
 
 [models]
 # Checkpoint / run paths on the CLUSTER filesystem. Leave a variant's paths
@@ -37,7 +39,10 @@ univ2_repo        = "<cluster-path>/tailcyclenet_v2"
 [local]
 python              = "<python-with-cv2-numpy-pandas>"
 ffprobe             = "ffprobe"
-log_dir             = "/tmp/tailcycle_run"   # per-session logs, queue files, blur cache
+log_dir             = "/tmp/tailcycle_run"   # per-session logs, queue files, blur cache;
+                                             # also read: gate_override_budget (reason) and
+                                             # tailcycle_max_concurrent.<animal>__<session> (N),
+                                             # for drivers already running
 # blur_cache        = "<path>/blur_cache.json"
 opencv_calib_root   = "<path>/calib"         # <date>/calibration/Cam*.yaml (OpenCV)
 jarvis_calib_root   = "<path>/jarvis_calibrations"   # <date>/Cam*.yaml (JARVIS)

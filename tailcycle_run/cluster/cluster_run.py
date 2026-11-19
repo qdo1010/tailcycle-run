@@ -4,13 +4,16 @@
 Flow:
   1. Stage full-resolution videos    <video_root>/<animal>/<session>/Cam*.mp4
                                   →  <cluster>:<work>/tailcycle_videos/<sid>/
+     (TAILCYCLE_SKIP_VIDEO_STAGE=1 reuses copies already staged; v2 variants
+     rewrap staged MPEG-TS cams to MP4 on the cluster, remux_ts.sh CPU job)
   2. Stage OpenCV Cam*.yaml calib    <opencv_calib_root>/<date>/calibration/
                                   →  <cluster>:<work>/tailcycle_calibs/<date>/
   3. Deploy harness scripts          tailcycle_run/cluster/{predict_chunk,merge_chunks}.{sh,py}
                                   →  <cluster>:<tools_remote>/tailcycle/
-  4. Submit LSF array + merge dep    K-way; each element ffmpeg-trims its own
-                                     N/K-frame chunk, converts to tailcycle format,
-                                     runs pixi + scripts/infer.py, drops chunk_iii.npz.
+  4. Submit LSF array + merge dep    K-way ('[1-K]%N', N = TAILCYCLE_MAX_CONCURRENT);
+                                     each element ffmpeg-trims its own N/K-frame chunk,
+                                     converts to tailcycle format, runs pixi +
+                                     scripts/infer.py, drops chunk_iii.npz.
                                      Merge job concats -> data3D.csv on cluster.
   5. Poll DONE / FAILED             via the CIFS mount (ssh only as fallback), backoff 1->10 min
   6. Pull                            <cluster>:<work>/predictions/<sid>/data3D.csv
@@ -54,6 +57,10 @@ FALLBACK_PRED_ROOT = _cfgp("local.fallback_pred_root", str(DEFAULT_PRED_ROOT))
 LOCAL_PYTHON       = _cfg("local.python", sys.executable)
 LOCAL_TAILCYCLENET = _cfgp("local.tailcyclenet_repo")
 JARVIS_CALIB_ROOT  = _cfgp("local.jarvis_calib_root")
+LOCAL_FFPROBE      = _cfg("local.ffprobe", "ffprobe")
+LOCAL_LOG_DIR      = _cfgp("local.log_dir", "/tmp/tailcycle_run")   # override / limit files
+CPU_QUEUE          = _cfg("cluster.cpu_queue", "local")       # CPU jobs (MPEG-TS rewrap)
+CLUSTER_LOG_DIR    = _cfg("cluster.log_dir", "~/logs")        # home-relative, CPU job logs
 
 DEFAULT_QUEUE     = _cfg("cluster.queue", "gpu_l4")
 DEFAULT_PROJECT   = _cfg("cluster.project")
@@ -360,7 +367,80 @@ def _gate_env(purpose: str) -> str:
         env["GATE_NOSANDBOX"] = nosb
     env.update(_cfg("gate.extra", {}))
     env["GATE_PURPOSE"] = purpose
+    # weekly-budget override, only on the operator's word: GATE_OVERRIDE_BUDGET
+    # env, or the reason in <local.log_dir>/gate_override_budget (picked up by
+    # drivers already running). The gate records the reason in its ledger.
+    # Remove the file when the batch is done.
+    ov = os.environ.get("GATE_OVERRIDE_BUDGET")
+    ov_file = LOCAL_LOG_DIR / "gate_override_budget"
+    if not ov and ov_file.exists():
+        ov = ov_file.read_text().strip()
+    if ov:
+        env["GATE_OVERRIDE_BUDGET"] = ov
     return " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + " "
+
+
+def _idx_spec(idxs) -> str:
+    """LSF array index list with runs compressed: [1..263] -> '1-263',
+    [1,2,3,4,5,9,12..20] -> '1-5,9,12-20'. 263 explicit indices made a job
+    name LSF rejects ("Bad job name", 2026-11-17)."""
+    runs: list[list[int]] = []
+    for i in sorted(set(int(i) for i in idxs)):
+        if runs and i == runs[-1][1] + 1:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i])
+    return ",".join(f"{a}-{b}" if b > a else str(a) for a, b in runs)
+
+
+def _concurrency_limit(vid_sid: str) -> str:
+    """LSF '%N' array slot limit from env TAILCYCLE_MAX_CONCURRENT, else the
+    per-session file <local.log_dir>/tailcycle_max_concurrent.<vid_sid> (for
+    drivers already launched); '' when neither is set. A limit lets a GPU-h
+    guard polling every few minutes act before the cap (2026-11-17: 255/263
+    elements finished inside one 15-min guard interval)."""
+    mc = os.environ.get("TAILCYCLE_MAX_CONCURRENT")
+    mc_file = LOCAL_LOG_DIR / f"tailcycle_max_concurrent.{vid_sid}"
+    if not mc and mc_file.exists():
+        mc = mc_file.read_text().strip()
+    return f"%{int(mc)}" if mc else ""
+
+
+def _container(p: Path) -> str:
+    """ffprobe format_name of a video (header read only)."""
+    r = subprocess.run([LOCAL_FFPROBE, "-v", "error", "-show_entries", "format=format_name",
+                        "-of", "csv=p=0", str(p)], capture_output=True, text=True, timeout=60)
+    return r.stdout.strip()
+
+
+def _remux_staged(vid_sid: str, staged: Path, n_ts: int) -> None:
+    """Rewrap the staged MPEG-TS cameras of one session to MP4 on the cluster
+    (remux_ts.sh: CPU job on cluster.cpu_queue, ffmpeg -c copy, a file is
+    replaced only if its TS packet count equals the MP4 frame count) and wait
+    for it. The wait reads the job's log and the REMUX_OK marker over the SMB
+    mount, one check per 3 min, no ssh."""
+    _rsync_up(LOCAL_TOOLS_DIR, "", extra=["--include=remux_ts.sh", "--exclude=*"])
+    (staged / "REMUX_OK").unlink(missing_ok=True)
+    rd = f"{CF_REMOTE}/tailcycle_videos/{vid_sid}"
+    log_rel = _remote_rel(CLUSTER_LOG_DIR)            # home-relative
+    (LOCAL_CIFS / log_rel).mkdir(parents=True, exist_ok=True)   # LSF won't create it
+    name = f"remux_{vid_sid}"
+    out = _ssh(f"cd ~ && {_gate_env(f'rewrap {n_ts} staged MPEG-TS cams of {vid_sid} to MP4 (stream copy), CPU only')}"
+               f"bsub -J '{name}' -q {CPU_QUEUE} -n 4 -W 6:00 -P {DEFAULT_PROJECT} "
+               f"-o ~/{log_rel}/{name}_%J.out -e ~/{log_rel}/{name}_%J.err "
+               f"bash {CF_REMOTE}/remux_ts.sh {rd} 4", timeout=300)
+    jid = _parse_bsub_id(out)
+    log = LOCAL_CIFS / log_rel / f"{name}_{jid}.out"
+    print(f"[tailcycle-cluster] rewrap job {jid} ({n_ts} TS cams), log {log}", flush=True)
+    t0 = time.time()
+    while not (staged / "REMUX_OK").exists():
+        txt = log.read_text(errors="replace") if log.exists() else ""
+        if "REMUX_HAD_FAILURES" in txt or "Exited with" in txt or "TERM_" in txt:
+            raise SystemExit(f"[tailcycle-cluster] rewrap job {jid} failed:\n{txt[-2000:]}")
+        if time.time() - t0 > 7 * 3600:
+            raise SystemExit(f"[tailcycle-cluster] rewrap job {jid}: no REMUX_OK after 7 h")
+        time.sleep(180)
+    print(f"[tailcycle-cluster] rewrap done in {(time.time() - t0) / 60:.0f} min", flush=True)
 
 
 def _site_env() -> str:
@@ -787,7 +867,9 @@ def submit(animal: str, session: str, *, num_chunks: int,
     #      one job with a clear message than fill the cluster filesystem and wedge
     #      everyone's jobs (the "Disk quota exceeded" incident).
     _reclaim_completed_staging()
-    _require_free_space_gb(min_free_gb=500)
+    # the 500 GB floor guards NEW staging; reusing already-staged videos
+    # (TAILCYCLE_SKIP_VIDEO_STAGE) only writes predictions (~1 GB)
+    _require_free_space_gb(min_free_gb=50 if os.environ.get("TAILCYCLE_SKIP_VIDEO_STAGE") else 500)
 
     # Stage ONLY the usable cameras:
     #   1. calibrated — a stray non-rig camera (e.g. Cam710040) absent from
@@ -940,8 +1022,17 @@ def submit(animal: str, session: str, *, num_chunks: int,
     pred_dir = LOCAL_CIFS / _remote_rel(f"predictions/{sid}")
     if not (pred_dir / "DONE").exists():
         pred_dir.mkdir(parents=True, exist_ok=True)
-    _rsync_up(videos, f"tailcycle_videos/{vid_sid}",
-               extra=[*cam_includes, "--exclude=*"])
+    staged = LOCAL_CIFS / _remote_rel(f"tailcycle_videos/{vid_sid}")
+    skip_stage = bool(os.environ.get("TAILCYCLE_SKIP_VIDEO_STAGE")
+                      and all((staged / f"{c}.mp4").exists() for c in allowed_cams))
+    if skip_stage:
+        # staged copies may have been rewrapped on the cluster (MPEG-TS -> MP4,
+        # stream copy) and so differ from the source on purpose
+        print(f"[tailcycle-cluster] TAILCYCLE_SKIP_VIDEO_STAGE: using the "
+              f"{len(allowed_cams)} staged videos as they are", flush=True)
+    else:
+        _rsync_up(videos, f"tailcycle_videos/{vid_sid}",
+                  extra=[*cam_includes, "--exclude=*"])
     # realigned overrides go up AFTER the main sync so they overwrite the
     # mount's desynced copies in the staged dir
     for c, p in overrides.items():
@@ -950,6 +1041,22 @@ def submit(animal: str, session: str, *, num_chunks: int,
                   flush=True)
             _rsync_up(p.parent, f"tailcycle_videos/{vid_sid}",
                        extra=[f"--include={c}.mp4", "--exclude=*"])
+    # Container check BEFORE any GPU: the v2 reader fetches exact frame
+    # indices, which MPEG-TS (some rigs save TS named .mp4) cannot give
+    # ("frames ... did not decode", 2026-11-17). The staged copies are
+    # what the cluster reads; TS ones are rewrapped to MP4 there (CPU job,
+    # stream copy, packet count verified) before anything is submitted.
+    if var.get("repo"):                       # the v2 checkouts (univ2_*)
+        ts = [c for c in allowed_cams
+              if _container(staged / f"{c}.mp4") == "mpegts"]
+        if ts:
+            _remux_staged(vid_sid, staged, n_ts=len(ts))
+            stage_lock.touch()
+            left = [c for c in allowed_cams
+                    if _container(staged / f"{c}.mp4") == "mpegts"]
+            if left:
+                raise SystemExit(f"[tailcycle-cluster] still MPEG-TS after the "
+                                 f"rewrap: {left}; not submitting")
 
     # NEW pipeline: tailcycle infer.py reads an aniposelib calibration.toml
     # directly via --calibration, so we build one aniposelib TOML from our
@@ -1149,10 +1256,13 @@ def submit(animal: str, session: str, *, num_chunks: int,
 
     arr_id = None
     if missing_idxs:
-        idx_spec = ",".join(str(i) for i in missing_idxs)   # LSF: '[1,3,7]'
+        idx_spec = _idx_spec(missing_idxs)                 # LSF: '[1-5,9,12-20]'
+        limit = _concurrency_limit(vid_sid)                # '%N' or ''
+        if limit:
+            print(f"[tailcycle-cluster] array concurrency limit {limit}", flush=True)
         array_cmd = (
             f"{_gate_env(f'tailcycle 3D pose prediction ({variant}) for {sid}; produces predictions/{sid}/data3D.csv')}"
-            f"bsub -J 'pc_{sid}[{idx_spec}]' -q {queue} -n {slots} "
+            f"bsub -J 'pc_{sid}[{idx_spec}]{limit}' -q {queue} -n {slots} "
             f"-gpu 'num=1' -W {wall} -P {project} "
             f"-o {logs_rel}/pc_%I_%J.log "
             f"env {_site_env()}bash -l {tools_dir}/predict_chunk.sh "

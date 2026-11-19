@@ -1,15 +1,18 @@
 """GPU-h projection before any staging.
 
-Measured on gpu_l4 for the univ2 models (1.4-1.7 fps per element plus about
-1 min of model/ffmpeg startup per chunk):
+Refit on gpu_l4 for univ2_47 (2026-11-17/18): 1.4-1.7 fps per element plus
+about 0.045 GPU-h (~2.7 min) of model/ffmpeg startup per window/chunk:
 
-    GPU-h ~= frames / 5000 + windows / 60
+    GPU-h ~= frames / 5000 + 0.045 * windows
+
+(The earlier frames/5000 + windows/60 under-counted startup: a 263-window,
+119,618-frame smoke projects 35.8 GPU-h and measured 35.7.)
 """
 from __future__ import annotations
 from pathlib import Path
 
 FRAMES_PER_GPU_H = 5000.0
-STARTUP_GPU_H_PER_WINDOW = 1 / 60
+STARTUP_GPU_H_PER_WINDOW = 0.045
 
 
 def parse_ranges(path: Path | str) -> list[tuple[int, int]]:

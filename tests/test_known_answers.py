@@ -45,14 +45,15 @@ def test_ranges_parser(tmp_path):
 
 def test_plan_projection(tmp_path):
     from tailcycle_run.plan import plan_ranges, projection
-    # 119,618 frames in 263 windows -> 23.92 + 4.38 = 28.31 GPU-h
-    assert projection(119618, 263) == pytest.approx(28.307, abs=1e-3)
-    assert projection(0, 60) == pytest.approx(1.0)
+    # 119,618 frames in 263 windows -> 23.92 + 11.84 = 35.76 GPU-h (measured 35.7)
+    assert projection(119618, 263) == pytest.approx(35.759, abs=1e-3)
+    assert round(projection(119618, 263), 1) == 35.8
+    assert projection(0, 100) == pytest.approx(4.5)
     f = tmp_path / "r.txt"
     f.write_text("0 5000\n10000 15000\n")
     p = plan_ranges(f)
     assert p["windows"] == 2 and p["frames"] == 10000
-    assert p["gpu_h"] == pytest.approx(2 + 2 / 60)
+    assert p["gpu_h"] == pytest.approx(2 + 2 * 0.045)
 
 
 def test_body_span_max_pairwise():
@@ -82,3 +83,85 @@ def test_submit_refuses_sealed_animal(tmp_path):
                        capture_output=True, text=True, timeout=60,
                        env={**os.environ, "TAILCYCLE_RUN_CONFIG": str(c)})
     assert r.returncode != 0 and "SEALED" in (r.stderr + r.stdout)
+
+
+def test_lsf_index_spec_and_limit(tmp_path, monkeypatch):
+    cr = _load("tailcycle_run/cluster/cluster_run.py")
+    assert cr._idx_spec(range(1, 264)) == "1-263"
+    assert cr._idx_spec([1, 2, 3, 4, 5, 9] + list(range(12, 21))) == "1-5,9,12-20"
+    assert cr._idx_spec([7]) == "7"
+    assert cr._idx_spec([3, 1, 2, 2]) == "1-3"
+    monkeypatch.setattr(cr, "LOCAL_LOG_DIR", tmp_path)
+    monkeypatch.delenv("TAILCYCLE_MAX_CONCURRENT", raising=False)
+    assert cr._concurrency_limit("a__s") == ""
+    (tmp_path / "tailcycle_max_concurrent.a__s").write_text("8\n")
+    assert cr._concurrency_limit("a__s") == "%8"
+    monkeypatch.setenv("TAILCYCLE_MAX_CONCURRENT", "12")
+    assert cr._concurrency_limit("a__s") == "%12"
+
+
+def test_gate_override_budget(tmp_path, monkeypatch):
+    cr = _load("tailcycle_run/cluster/cluster_run.py")
+    monkeypatch.setattr(cr, "LOCAL_LOG_DIR", tmp_path)
+    monkeypatch.delenv("GATE_OVERRIDE_BUDGET", raising=False)
+    assert "GATE_OVERRIDE_BUDGET" not in cr._gate_env("p")
+    (tmp_path / "gate_override_budget").write_text("approved batch\n")
+    assert "GATE_OVERRIDE_BUDGET='approved batch'" in cr._gate_env("p")
+    monkeypatch.setenv("GATE_OVERRIDE_BUDGET", "from env")
+    assert "GATE_OVERRIDE_BUDGET='from env'" in cr._gate_env("p")
+
+
+def test_hurdle_windows_merge_split():
+    hw = _load("tailcycle_run/post/hurdle_windows.py")
+    # pad 2: frames 10 and 13 overlap -> one window; 30 alone; clipped at 0 / n_total
+    assert hw.windows_from_frames([13, 10, 30, 0], 2, 32, 100) == [(0, 3), (8, 16), (28, 32)]
+    # a 20-frame window split at max_frames 8
+    assert hw.windows_from_frames([10], 10, 100, 8) == [(0, 8), (8, 16), (16, 21)]
+
+
+def test_hurdle_windows_empty_map(tmp_path):
+    import json
+    import subprocess
+    sd = tmp_path / "a" / "s"
+    (sd / "objects").mkdir(parents=True)
+    (sd / "objects" / "hurdle_map.json").write_text(json.dumps({"objects": []}))
+    out = tmp_path / "r.txt"
+    r = subprocess.run([sys.executable, str(ROOT / "tailcycle_run/post/hurdle_windows.py"),
+                        "--pred-root", str(tmp_path), "--animal", "a", "--session", "s",
+                        "--out", str(out)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "no mapped sheet" in r.stdout and not out.exists()
+
+
+def test_run_stage_skips_and_stops_at_cap(tmp_path):
+    """The plan driver skips a session that has output and stops before one
+    whose projection exceeds the total cap -- both before any cluster call."""
+    import os
+    import subprocess
+    vroot, proot = tmp_path / "v", tmp_path / "p"
+    (proot / "m1" / "s1" / "tailcycle47_v2").mkdir(parents=True)
+    (proot / "m1" / "s1" / "tailcycle47_v2" / "data3D.csv").write_text("x\n")
+    cfg = (ROOT / "config.example.toml").read_text() + (
+        f'\n[sources.t]\nvideo_root = "{vroot}"\npred_root = "{proot}"\n'
+        f'animals = ["m1"]\nmin_cams = 8\n')
+    cfg = cfg.replace('log_dir             = "/tmp/tailcycle_run"',
+                      f'log_dir             = "{tmp_path / "logs"}"')
+    c = tmp_path / "c.toml"
+    c.write_text(cfg)
+    plan = tmp_path / "plan.tsv"
+    plan.write_text("tab\tanimal\tsession\tranges\tproj_gpuh\n"
+                    "t\tm1\ts1\tr1.txt\t5.0\n"
+                    "t\tm1\ts2\tr2.txt\t50.0\n")
+    env = {**os.environ, "TAILCYCLE_RUN_CONFIG": str(c)}
+    r = subprocess.run([sys.executable, "-m", "tailcycle_run", "run", "--plan", str(plan),
+                        "--total-cap", "10"], capture_output=True, text=True, timeout=60,
+                       env=env, cwd=ROOT)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "already has tailcycle47_v2, skipping" in out
+    assert "STOP: spent 0.0 + projected 50.0 > total cap 10" in out
+    assert "BATCH END: total 0.0 GPU-h" in out
+    plan.write_text("tab\tanimal\tsession\tranges\tproj_gpuh\nnope\tm1\ts1\tr\t1\n")
+    r = subprocess.run([sys.executable, "-m", "tailcycle_run", "run", "--plan", str(plan),
+                        "--total-cap", "10"], capture_output=True, text=True, timeout=60,
+                       env=env, cwd=ROOT)
+    assert r.returncode != 0 and "not in the config" in r.stderr

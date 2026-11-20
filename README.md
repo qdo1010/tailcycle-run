@@ -7,6 +7,11 @@ post-processes it. It was extracted from a lab dashboard. The code
 behaves as it did there, except that every site value now comes from a config
 file.
 
+**Just want tailcyclenet faster on several GPUs, without this lab setup?** See
+[docs/parallel-gpu-inference](docs/parallel-gpu-inference/README.md): a
+self-contained recipe (split into frame windows, one `infer` per GPU, merge)
+that needs only a tailcyclenet checkout.
+
 tailcyclenet itself (the model code) is **not** in this repo. This repo is the
 driver around it: it moves data, builds the calibration, talks to LSF, guards
 the GPU budget and cleans the output.

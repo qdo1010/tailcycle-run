@@ -7,6 +7,50 @@ post-processes it. It was extracted from a lab dashboard. The code
 behaves as it did there, except that every site value now comes from a config
 file.
 
+tailcyclenet itself (the model code) is **not** in this repo. This repo is the
+driver around it: it moves data, builds the calibration, talks to LSF, guards
+the GPU budget and cleans the output.
+
+## How it works
+
+```
+ local workstation                              LSF cluster
+ ─────────────────                              ───────────
+ <video_root>/<animal>/<session>/Cam*.mp4  ──►  <work_dir>/tailcycle_videos/<animal>__<session>/
+ <opencv_calib_root>/<date>/calibration/   ──►  <work_dir>/tailcycle_calibs/<date>/calibration.toml
+         (both copied over the SMB mount of the cluster home; ssh is for bsub/bjobs/df only)
+
+ tailcycle-run submit ── bsub ──►  smoke job (24 frames)
+                                   array [1-K]: one element = one frame window
+                                       predict_chunk.sh -> tailcyclenet infer.py -> chunk_NNN.npz
+                                   merge job (-w ended(array)): merge_chunks.sh -> predictions/<sid>/data3D.csv + DONE
+
+ <pred_root>/<animal>/<session>/<out_name>/data3D.csv  ◄── pulled over the mount, plus info.yaml
+        │
+        └── post: yolo-clean, body-span, presence, trials, hurdle-windows, align
+```
+
+Status is read from marker files (`DONE`, `FAILED`, `smoke.FAILED`, `REMUX_OK`)
+on the SMB mount. The driver never polls the login node.
+
+## Prerequisites
+
+You need all of these before the first run:
+
+| need | why |
+|---|---|
+| Python >= 3.10 | the driver and post-processing |
+| `ffprobe` on the PATH | container check (MPEG-TS vs MP4), frame counts |
+| `ssh` to the LSF login node, key-based | `bsub`, `bjobs`, `bkill`, `df` only |
+| the cluster home mounted locally over SMB/CIFS | all bulk data and status markers move here; submit stops when it is down |
+| a `tailcyclenet` checkout with `pixi` on the cluster | the model code the array jobs run (`cluster.tailcycle_repo`, `cluster.pixi`) |
+| model checkpoints on the cluster filesystem | one set per variant you use (`[models]`) |
+| per-date OpenCV calibration yamls locally | `<opencv_calib_root>/<date>/calibration/Cam*.yaml` |
+| a GPU queue and an LSF project you may use | `cluster.queue`, `cluster.project` |
+| (post-processing only) a YOLO weights file and the lab's `analyzeMiceTrajectory` checkout | see [Known couplings](#known-couplings--todo) |
+
+`config.example.toml` is the full list of site values, with comments.
+
 ## Install
 
 ```bash
@@ -18,7 +62,53 @@ cp config.example.toml ~/.config/tailcycle-run/config.toml   # then fill in <pla
 The config path can also be given with `TAILCYCLE_RUN_CONFIG=/path/config.toml`.
 **Keep the filled config out of git.** It names hosts, users and paths.
 Nothing site-specific is hard-coded in the package; `tests/test_scrub.py`
-enforces that.
+enforces that. `.gitignore` already excludes `config.toml`.
+
+## Quick start: one session
+
+Expected inputs:
+- videos at `<video_root>/<animal>/<session>/Cam<serial>.mp4`, one file per camera
+  (session names look like `2026_11_17_14_30_05`);
+- a calibration for the session's date, or an adjacent one (the nearest date is
+  used when the exact date is missing; force one with `--calib-date YYYY_MM_DD`).
+
+```bash
+# 1. Project the cost. Nothing is staged. Get the number approved first.
+tailcycle-run plan --ranges windows.txt --video-dir /path/to/<animal>/<session>
+#    windows.txt: one "FS FE" per line, half-open source frames, '#' comments ok
+#    or, without a file:  tailcycle-run plan --frames 119618 --windows 263
+
+# 2. Run it: stage -> smoke -> array -> merge -> poll -> pull.
+tailcycle-run submit --animal A --session S --variant univ2_47 --ranges-file windows.txt
+
+# 3. Post-process the result.
+tailcycle-run post yolo-clean --help
+tailcycle-run post body-span --help
+```
+
+A `submit` for a session that already has `DONE` on the cluster skips straight
+to the pull, and the staging directory name is deterministic
+(`<animal>__<session>`), so re-running after an interruption is safe.
+
+Many sessions: `batch` (one at a time, from `[sources.<tab>]`) or `run` (an
+unattended plan file with a total GPU-h cap). See [Plan batches](#plan-batches-run).
+
+## Where things land
+
+| what | where |
+|---|---|
+| staged videos | `<work_dir>/tailcycle_videos/<animal>__<session>/` (cluster; reclaimed after DONE) |
+| calibration | `<work_dir>/tailcycle_calibs/<date>/calibration.toml` (built from the OpenCV yamls) |
+| harness scripts | `<tools_dir>/...`, a content-hashed directory per version, so running jobs never see a change |
+| per-chunk output and markers | `<work_dir>/predictions/<sid>/` (cluster) |
+| **result** | `<pred_root>/<animal>/<session>/<out_name>/data3D.csv` (local) |
+| run record | `<out_name>/info.yaml` next to it: calibration, model, array id, world frame |
+| scorer quality | `quality.csv`, only for variants with a scorer (`univ24`, `univ47`) |
+| gated pose | `yolo_clean*/data3D.csv` and `masks.npz`, from `post yolo-clean` |
+| driver logs | `<local.log_dir>/tailcycle_<animal>_<session>[_<variant>].log` |
+
+`data3D.csv` has one row per video frame. Frames outside the predicted windows
+stay NaN.
 
 ## Stages
 
@@ -177,6 +267,31 @@ The tests need no cluster:
 - `body_span.max_pairwise` on a hand-made array;
 - the sealed-animal refusal;
 - the scrub test.
+
+## Troubleshooting
+
+| symptom | cause and fix |
+|---|---|
+| `no config at ...` | copy `config.example.toml` to `~/.config/tailcycle-run/config.toml` or set `TAILCYCLE_RUN_CONFIG` |
+| `config key '...' missing` | fill that key; the message names it |
+| submit stops at once | the SMB mount of the cluster home is down. Remount it; the login node is not used as a data path |
+| `only N usable cameras` | fewer than 8 cameras passed the gates (blur, reprojection error, frame-count desync, no video). Fix the data; do not lower the floor |
+| refuses to submit, camera still MPEG-TS | the rewrap job failed or timed out (7 h). Read its log in `cluster.log_dir`, fix, re-run |
+| smoke test FAILED | the driver prints the real infer error from the smoke log. Usually a cluster checkout, model path or flag mismatch (preflight checks the `infer.py` flags) |
+| `<animal> is a SEALED animal` | by design. `--allow-sealed` only for the final held-out test |
+| aborted: below 500 GB free | the disk floor on `cluster.df_path`. Wait for reclaim, or free space |
+| bsub rejects the job name | too many explicit array indices; the driver compresses them to ranges, so this means a custom change |
+| guard killed the array | measured or projected GPU-h passed the cap. Check the projection, then re-run with a new cap on the budget owner's word |
+| stale `data3D.csv`, run not finished | completion is keyed on `DONE`, not on the CSV, which persists across runs |
+
+## Collaborating
+
+- The GitHub repo is **private**. A collaborator needs to be added on GitHub
+  (Settings -> Collaborators) before they can clone it.
+- Each person keeps their own filled `config.toml`. Never commit it.
+- Run `plan` and have the GPU-h approved before any `submit` or `run`.
+- Run `pytest` before pushing. `test_scrub.py` fails if a host, user, path or
+  similar site string reaches a tracked file.
 
 ## Known couplings / TODO
 

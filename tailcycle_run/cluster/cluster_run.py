@@ -34,6 +34,17 @@ import sys
 import time
 from pathlib import Path
 
+# Cap this driver's LOCAL threads (shared-workstation load). The camera gates
+# (blur audit, frame-count check) open every camera with cv2.VideoCapture, whose
+# FFmpeg decoder starts one thread per core; cv2.setNumThreads does not reach
+# it, OPENCV_FFMPEG_CAPTURE_OPTIONS does. setdefault, so an explicit env wins;
+# child processes inherit the caps. Override with TAILCYCLE_LOCAL_THREADS.
+_LOCAL_THREADS = os.environ.get("TAILCYCLE_LOCAL_THREADS", "3")
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_k, _LOCAL_THREADS)
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", f"threads;{_LOCAL_THREADS}")
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tailcycle_run.config import get as _cfg, path as _cfgp  # noqa: E402
 

@@ -414,6 +414,9 @@ def _concurrency_limit(vid_sid: str) -> str:
     mc_file = LOCAL_LOG_DIR / f"tailcycle_max_concurrent.{vid_sid}"
     if not mc and mc_file.exists():
         mc = mc_file.read_text().strip()
+    cap = _cfg("cluster.max_concurrent", None)   # site ceiling on any array, e.g. 8
+    if cap:
+        mc = min(int(mc), int(cap)) if mc else int(cap)
     return f"%{int(mc)}" if mc else ""
 
 

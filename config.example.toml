@@ -22,6 +22,7 @@ tailcycle_repo = "$HOME/tailcyclenet"         # default tailcyclenet checkout on
 pixi        = "$HOME/.pixi/bin/pixi"
 cpu_queue   = "local"                         # CPU-only jobs (the MPEG-TS -> MP4 rewrap)
 log_dir     = "~/logs"                        # home-relative; CPU job logs, read back over smb_mount
+# max_concurrent = 8                          # optional ceiling on any GPU array's %N slot limit
 
 [models]
 # Checkpoint / run paths on the CLUSTER filesystem. Leave a variant's paths
